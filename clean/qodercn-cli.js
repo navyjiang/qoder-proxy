@@ -3,6 +3,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const { AppError } = require('./errors');
 const { redactString } = require('./redact');
+const { log } = require('./logger');
 const { resolveModelRoute } = require('./models');
 const { buildToolSystemPrompt, formatToolResultForPrompt } = require('./tool-parser');
 
@@ -417,6 +418,7 @@ function runQoderCnCli({
   const command = resolveCliCommand(process.env.CLI_COMMAND || process.env.QODERCN_CLI_PATH || backend.command);
   const modelRoute = resolveModelRoute(model);
   const cliModel = modelRoute.cliModel;
+  log('resolved cliModel', { model, cliModel });
   // Build prompt with non-system messages only (system prompt goes via CLI flag)
   const prompt = buildPrompt(nonSystemMessages, tools);
   const timeoutMs = Number(process.env.QODERCN_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
@@ -585,6 +587,7 @@ function runQoderCnCliStream({
   const command = resolveCliCommand(process.env.CLI_COMMAND || process.env.QODERCN_CLI_PATH || backend.command);
   const modelRoute = resolveModelRoute(model);
   const cliModel = modelRoute.cliModel;
+  log('resolved cliModel', { model, cliModel });
   const prompt = buildPrompt(nonSystemMessages, tools);
   const timeoutMs = Number(process.env.QODERCN_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
   const effort = reasoningEffort || modelRoute.reasoningEffort || process.env.QODERCN_REASONING_EFFORT;
