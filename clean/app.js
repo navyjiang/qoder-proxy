@@ -26,6 +26,9 @@ const { trackRequest, getUsage, resetUsage, saveUsage, extractTextFromMessages }
 const { executeToolCall } = require('./tools-executor');
 
 const MODEL_ID = DEFAULT_MODEL_ID;
+// Claude Code-style clients resend the full conversation history on every
+// request, which easily exceeds 1MB for resumed sessions. Default to 25mb.
+const BODY_LIMIT = process.env.QODERCN_BODY_LIMIT || '25mb';
 
 function validateChatRequest(body) {
   if (!body || typeof body !== 'object') {
@@ -215,7 +218,7 @@ function createApp() {
   const app = express();
   app.disable('x-powered-by');
   app.use(cors({ origin: true }));
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: BODY_LIMIT }));
 
   app.get('/health', (_req, res) => {
     res.json({ ok: true });
@@ -526,6 +529,17 @@ function createApp() {
           });
         } catch (streamError) {
           if (!res.writableEnded) {
+            // Emit a spec-shaped error event so clients (e.g. Claude Code) can
+            // surface the real failure instead of a bare truncated stream.
+            try {
+              writeAnthropicSse(res, 'error', {
+                type: 'error',
+                error: {
+                  type: streamError.type || 'api_error',
+                  message: streamError.message || 'Upstream request failed.',
+                },
+              });
+            } catch (_) { /* ignore */ }
             try { res.end(); } catch (_) { /* ignore */ }
           }
           log('anthropic stream failed', {
@@ -717,7 +731,14 @@ function createApp() {
     openAiError(res, new AppError(404, 'not_found', 'Route not found.'));
   });
 
-  app.use((error, _req, res, _next) => {
+  app.use((error, req, res, _next) => {
+    // Body-parse failures (e.g. 413) land here before any route runs —
+    // answer in Anthropic shape for Anthropic routes so clients like
+    // Claude Code can display the real error message.
+    if (req.path && req.path.startsWith('/v1/messages')) {
+      anthropicError(res, error);
+      return;
+    }
     openAiError(res, error);
   });
 

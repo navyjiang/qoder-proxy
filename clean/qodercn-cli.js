@@ -9,8 +9,6 @@ const { buildToolSystemPrompt, formatToolResultForPrompt } = require('./tool-par
 
 const DEFAULT_TIMEOUT_MS = 300000;
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
-const ATTACHMENT_INSTRUCTION =
-  'Answer the attached OpenAI-compatible chat completion request. Return only the final assistant message content.';
 
 /**
  * Resolve the CLI backend configuration.
@@ -238,16 +236,29 @@ function appendChunk(chunks, chunk, currentBytes) {
   return nextBytes;
 }
 
+// Decide whether qodercli's built-in tools should be disabled for a request.
+// QODERCN_BUILTIN_TOOLS: 'auto' (default) disables them when the client sent
+// its own tools, 'off' always disables, 'on' never disables.
+function resolveBuiltinToolsDisabled(tools) {
+  const mode = String(process.env.QODERCN_BUILTIN_TOOLS || 'auto').trim().toLowerCase();
+  if (['off', 'none', 'disabled'].includes(mode)) return true;
+  if (['on', 'default', 'enabled'].includes(mode)) return false;
+  return Array.isArray(tools) && tools.length > 0;
+}
+
 function buildCliArgs({
-  prompt,
   model,
   reasoningEffort,
   contextWindow,
   maxOutputTokens,
-  attachmentPath,
-  appendSystemPrompt,
   stream,
+  disableBuiltinTools,
 }) {
+  // The prompt itself is piped to the CLI via stdin, never via arguments or an
+  // attachment file: command-line arguments are size-limited (128 KiB per arg
+  // on Linux => spawn E2BIG, ~32k chars on Windows), and an --attachment file
+  // would force the agent to read it back with a built-in tool that
+  // `--tools ''` explicitly disables.
   const args = [
     '--print',
     '--output-format',
@@ -257,12 +268,10 @@ function buildCliArgs({
     '--dangerously-skip-permissions',
   ];
 
-  if (attachmentPath) {
-    args.push('--attachment', attachmentPath);
-  }
-
-  if (appendSystemPrompt) {
-    args.push('--append-system-prompt', appendSystemPrompt);
+  if (disableBuiltinTools) {
+    // Clients like Claude Code own the tool loop themselves; leaving qodercli's
+    // built-in tools enabled adds agent round-trips that can exceed the timeout.
+    args.push('--tools', '');
   }
 
   if (reasoningEffort) {
@@ -277,7 +286,6 @@ function buildCliArgs({
     args.push('--max-output-tokens', String(maxOutputTokens));
   }
 
-  args.push('--', attachmentPath ? ATTACHMENT_INSTRUCTION : prompt);
   return args;
 }
 
@@ -344,48 +352,6 @@ function resolveCliCommand(command, env = process.env) {
   return command;
 }
 
-/**
- * Windows command line has a ~32,767 character limit (CreateProcessW).
- * When --append-system-prompt is too long, prepend it to the attachment
- * file and remove it from CLI args to avoid spawn ENAMETOOLONG.
- */
-function fixLongAppendSystemPrompt(args, attachmentPath, command) {
-  if (process.platform !== 'win32' || !attachmentPath) return args;
-
-  const idx = args.indexOf('--append-system-prompt');
-  if (idx === -1) return args;
-
-  const systemPrompt = args[idx + 1];
-  if (!systemPrompt) return args;
-
-  // Rough estimate: include command name and a safety margin
-  const totalLength = (command?.length || 10) + args.reduce((acc, s) => acc + s.length + 1, 0);
-  if (totalLength < 30000) return args;
-
-  try {
-    const original = fs.readFileSync(attachmentPath, 'utf8');
-    fs.writeFileSync(attachmentPath, systemPrompt + '\n\n' + original, 'utf8');
-  } catch (e) {
-    // If we can't modify the file, keep original args and hope for the best
-    return args;
-  }
-
-  const newArgs = [...args];
-  newArgs.splice(idx, 2);
-  return newArgs;
-}
-
-function createPromptAttachment(rootDir, prompt) {
-  const promptDir = path.join(rootDir, '.runtime', 'prompts');
-  fs.mkdirSync(promptDir, { recursive: true });
-  const filePath = path.join(
-    promptDir,
-    `prompt-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`
-  );
-  fs.writeFileSync(filePath, prompt, 'utf8');
-  return filePath;
-}
-
 function runQoderCnCli({
   messages,
   model,
@@ -407,36 +373,23 @@ function runQoderCnCli({
     );
   }
 
-  // Extract system messages for --append-system-prompt
-  const systemMessages = messages.filter((m) => m.role === 'system');
-  const nonSystemMessages = messages.filter((m) => m.role !== 'system');
-  const appendSystemPrompt = systemMessages
-    .map((m) => normalizeContent(m.content))
-    .filter(Boolean)
-    .join('\n\n');
-
   const command = resolveCliCommand(process.env.CLI_COMMAND || process.env.QODERCN_CLI_PATH || backend.command);
   const modelRoute = resolveModelRoute(model);
   const cliModel = modelRoute.cliModel;
   log('resolved cliModel', { model, cliModel });
-  // Build prompt with non-system messages only (system prompt goes via CLI flag)
-  const prompt = buildPrompt(nonSystemMessages, tools);
+  const prompt = buildPrompt(messages, tools);
   const timeoutMs = Number(process.env.QODERCN_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
   const effort = reasoningEffort || modelRoute.reasoningEffort || process.env.QODERCN_REASONING_EFFORT;
   const windowSize = contextWindow || process.env.QODERCN_CONTEXT_WINDOW;
   const outputTokens = maxOutputTokens || process.env.QODERCN_MAX_OUTPUT_TOKENS;
-  const attachmentPath = createPromptAttachment(rootDir, prompt);
   const args = buildCliArgs({
-    prompt,
     model: cliModel,
     reasoningEffort: effort,
     contextWindow: windowSize,
     maxOutputTokens: outputTokens,
-    attachmentPath,
-    appendSystemPrompt: appendSystemPrompt || undefined,
+    disableBuiltinTools: resolveBuiltinToolsDisabled(tools),
   });
   const spawnSpec = buildSpawnCommand(command, args, backend);
-  const finalArgs = fixLongAppendSystemPrompt(spawnSpec.args, attachmentPath, spawnSpec.command);
 
   return new Promise((resolve, reject) => {
     let stdoutBytes = 0;
@@ -446,19 +399,22 @@ function runQoderCnCli({
     let settled = false;
     let timedOut = false;
 
-    const child = spawn(spawnSpec.command, finalArgs, {
+    const child = spawn(spawnSpec.command, spawnSpec.args, {
       cwd: rootDir,
       env: buildChildEnv(rootDir, token, backend),
       windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
+
+    // Pipe the prompt via stdin (see buildCliArgs for why not args/attachment).
+    child.stdin.on('error', () => { /* ignore EPIPE if the CLI exits early */ });
+    child.stdin.end(prompt);
 
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener?.('abort', onAbort);
-      fs.rmSync(attachmentPath, { force: true });
       fn(value);
     };
 
@@ -577,35 +533,24 @@ function runQoderCnCliStream({
     );
   }
 
-  const systemMessages = messages.filter((m) => m.role === 'system');
-  const nonSystemMessages = messages.filter((m) => m.role !== 'system');
-  const appendSystemPrompt = systemMessages
-    .map((m) => normalizeContent(m.content))
-    .filter(Boolean)
-    .join('\n\n');
-
   const command = resolveCliCommand(process.env.CLI_COMMAND || process.env.QODERCN_CLI_PATH || backend.command);
   const modelRoute = resolveModelRoute(model);
   const cliModel = modelRoute.cliModel;
   log('resolved cliModel', { model, cliModel });
-  const prompt = buildPrompt(nonSystemMessages, tools);
+  const prompt = buildPrompt(messages, tools);
   const timeoutMs = Number(process.env.QODERCN_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
   const effort = reasoningEffort || modelRoute.reasoningEffort || process.env.QODERCN_REASONING_EFFORT;
   const windowSize = contextWindow || process.env.QODERCN_CONTEXT_WINDOW;
   const outputTokens = maxOutputTokens || process.env.QODERCN_MAX_OUTPUT_TOKENS;
-  const attachmentPath = createPromptAttachment(rootDir, prompt);
   const args = buildCliArgs({
-    prompt,
     model: cliModel,
     reasoningEffort: effort,
     contextWindow: windowSize,
     maxOutputTokens: outputTokens,
-    attachmentPath,
-    appendSystemPrompt: appendSystemPrompt || undefined,
     stream: true,
+    disableBuiltinTools: resolveBuiltinToolsDisabled(tools),
   });
   const spawnSpec = buildSpawnCommand(command, args, backend);
-  const finalArgs = fixLongAppendSystemPrompt(spawnSpec.args, attachmentPath, spawnSpec.command);
 
   return new Promise((resolve, reject) => {
     let stdoutBytes = 0;
@@ -616,19 +561,22 @@ function runQoderCnCliStream({
     let lineBuffer = '';
     const fullTextParts = [];
 
-    const child = spawn(spawnSpec.command, finalArgs, {
+    const child = spawn(spawnSpec.command, spawnSpec.args, {
       cwd: rootDir,
       env: buildChildEnv(rootDir, token, backend),
       windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
+
+    // Pipe the prompt via stdin (see buildCliArgs for why not args/attachment).
+    child.stdin.on('error', () => { /* ignore EPIPE if the CLI exits early */ });
+    child.stdin.end(prompt);
 
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener?.('abort', onAbort);
-      fs.rmSync(attachmentPath, { force: true });
       fn(value);
     };
 
@@ -734,16 +682,14 @@ function runQoderCnCliStream({
 }
 
 module.exports = {
-  ATTACHMENT_INSTRUCTION,
   buildCliArgs,
   buildPrompt,
   buildSpawnCommand,
-  createPromptAttachment,
   extractAssistantContent,
   extractStreamDelta,
-  fixLongAppendSystemPrompt,
   getCliBackend,
   normalizeMessages,
+  resolveBuiltinToolsDisabled,
   resolveCliCommand,
   runQoderCnCli,
   runQoderCnCliStream,

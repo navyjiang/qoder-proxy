@@ -7,10 +7,9 @@ const {
   buildCliArgs,
   buildPrompt,
   buildSpawnCommand,
-  createPromptAttachment,
   extractAssistantContent,
   extractStreamDelta,
-  fixLongAppendSystemPrompt,
+  resolveBuiltinToolsDisabled,
   resolveCliCommand,
 } = require('../clean/qodercn-cli');
 const { resolveModelRoute } = require('../clean/models');
@@ -43,21 +42,58 @@ test('rejects unstructured text output', () => {
 });
 
 test('builds qoderclicn print-mode args without unsupported flags', () => {
-  const args = buildCliArgs({ prompt: 'hello', model: 'auto' });
+  const args = buildCliArgs({ model: 'auto' });
 
-  assert.deepEqual(args.slice(0, 5), ['--print', '--output-format', 'json', '--model', 'auto']);
-  assert.equal(args.at(-2), '--');
-  assert.equal(args.at(-1), 'hello');
+  assert.deepEqual(args, [
+    '--print',
+    '--output-format',
+    'json',
+    '--model',
+    'auto',
+    '--dangerously-skip-permissions',
+  ]);
+  // The prompt is piped via stdin and must never appear on the command line:
+  // Linux caps a single argv entry at 128 KiB (spawn E2BIG) and Windows caps
+  // the whole command line at ~32k chars.
+  assert.equal(args.includes('--'), false);
+  assert.equal(args.includes('--attachment'), false);
   assert.equal(args.includes('--max-turns=1'), false);
   assert.equal(args.includes('--tools'), false);
 });
 
+test('disables qodercli built-in tools when requested', () => {
+  const args = buildCliArgs({ model: 'auto', disableBuiltinTools: true });
+
+  const toolsIndex = args.indexOf('--tools');
+  assert.notEqual(toolsIndex, -1);
+  assert.equal(args[toolsIndex + 1], '');
+});
+
+test('resolves built-in tools mode from env and request tools', () => {
+  const original = process.env.QODERCN_BUILTIN_TOOLS;
+  const tools = [{ name: 'Bash' }];
+  try {
+    delete process.env.QODERCN_BUILTIN_TOOLS;
+    assert.equal(resolveBuiltinToolsDisabled(tools), true);
+    assert.equal(resolveBuiltinToolsDisabled([]), false);
+    assert.equal(resolveBuiltinToolsDisabled(undefined), false);
+
+    process.env.QODERCN_BUILTIN_TOOLS = 'off';
+    assert.equal(resolveBuiltinToolsDisabled(undefined), true);
+
+    process.env.QODERCN_BUILTIN_TOOLS = 'on';
+    assert.equal(resolveBuiltinToolsDisabled(tools), false);
+  } finally {
+    if (original === undefined) delete process.env.QODERCN_BUILTIN_TOOLS;
+    else process.env.QODERCN_BUILTIN_TOOLS = original;
+  }
+});
+
 test('builds qoderclicn reasoning effort args when requested', () => {
-  const args = buildCliArgs({ prompt: 'hello', model: 'Qwen3.7-Max', reasoningEffort: 'high' });
+  const args = buildCliArgs({ model: 'Qwen3.7-Max', reasoningEffort: 'high' });
 
   assert.equal(args.includes('--reasoning-effort'), true);
   assert.equal(args[args.indexOf('--reasoning-effort') + 1], 'high');
-  assert.equal(args.at(-1), 'hello');
 });
 
 test('resolves effort model aliases to base qoderclicn model and effort', () => {
@@ -70,7 +106,6 @@ test('resolves effort model aliases to base qoderclicn model and effort', () => 
 
 test('builds qoderclicn context and output token args when requested', () => {
   const args = buildCliArgs({
-    prompt: 'hello',
     model: 'Qwen3.7-Max',
     contextWindow: 200000,
     maxOutputTokens: 4096,
@@ -78,31 +113,6 @@ test('builds qoderclicn context and output token args when requested', () => {
 
   assert.equal(args[args.indexOf('--context-window') + 1], '200000');
   assert.equal(args[args.indexOf('--max-output-tokens') + 1], '4096');
-});
-
-test('builds qoderclicn attachment args without putting long prompt on command line', () => {
-  const longPrompt = 'x'.repeat(100000);
-  const args = buildCliArgs({
-    prompt: longPrompt,
-    model: 'Qwen3.7-Max',
-    attachmentPath: '/tmp/prompt.txt',
-  });
-
-  assert.equal(args.includes('--attachment'), true);
-  assert.equal(args[args.indexOf('--attachment') + 1], '/tmp/prompt.txt');
-  assert.equal(args.includes(longPrompt), false);
-  assert.match(args.at(-1), /attached OpenAI-compatible/);
-});
-
-test('creates prompt attachment under project runtime directory', () => {
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'qodercn-prompt-'));
-  try {
-    const filePath = createPromptAttachment(temp, 'hello');
-    assert.equal(filePath.startsWith(path.join(temp, '.runtime', 'prompts')), true);
-    assert.equal(fs.readFileSync(filePath, 'utf8'), 'hello');
-  } finally {
-    fs.rmSync(temp, { recursive: true, force: true });
-  }
 });
 
 test('wraps Windows cmd shims for spawning', () => {
@@ -173,12 +183,12 @@ test('resolveCliCommand keeps explicit CLI paths unchanged', () => {
 });
 
 test('builds stream-json output format when stream is requested', () => {
-  const args = buildCliArgs({ prompt: 'hello', model: 'auto', stream: true });
+  const args = buildCliArgs({ model: 'auto', stream: true });
   assert.deepEqual(args.slice(0, 5), ['--print', '--output-format', 'stream-json', '--model', 'auto']);
 });
 
 test('defaults to non-streaming json format when stream is not set', () => {
-  const args = buildCliArgs({ prompt: 'hello', model: 'auto' });
+  const args = buildCliArgs({ model: 'auto' });
   assert.deepEqual(args.slice(0, 5), ['--print', '--output-format', 'json', '--model', 'auto']);
 });
 
@@ -234,59 +244,17 @@ test('extractStreamDelta joins multiple text blocks', () => {
   assert.equal(extractStreamDelta(record), 'first second');
 });
 
-test('fixLongAppendSystemPrompt returns original args on non-Windows', () => {
-  const args = ['--print', '--append-system-prompt', 'sys', '--model', 'auto'];
-  const result = fixLongAppendSystemPrompt(args, '/tmp/prompt.txt', 'qoderclicn');
-  assert.deepEqual(result, args);
-});
+test('buildPrompt includes large system prompts without size limits', () => {
+  // Regression guard for the spawn E2BIG fix: oversized system prompts used to
+  // be passed via --append-system-prompt / --attachment. Now they stay inside
+  // the prompt string that is piped to the CLI over stdin, which has no size
+  // cap. A 140 KB system prompt must survive intact in the built prompt.
+  const longSystemPrompt = 'x'.repeat(140 * 1024);
+  const prompt = buildPrompt([
+    { role: 'system', content: longSystemPrompt },
+    { role: 'user', content: 'hi' },
+  ]);
 
-test('fixLongAppendSystemPrompt moves long system prompt into attachment on Windows', () => {
-  const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
-  Object.defineProperty(process, 'platform', { value: 'win32' });
-  try {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qodercn-fix-'));
-    const attachmentPath = path.join(tempDir, 'prompt.txt');
-    fs.writeFileSync(attachmentPath, 'original content', 'utf8');
-
-    const longSystemPrompt = 'x'.repeat(40000);
-    const args = ['--print', '--append-system-prompt', longSystemPrompt, '--model', 'auto'];
-    const result = fixLongAppendSystemPrompt(args, attachmentPath, 'qoderclicn');
-
-    // --append-system-prompt should be removed from args
-    assert.equal(result.includes('--append-system-prompt'), false);
-    assert.equal(result.includes(longSystemPrompt), false);
-
-    // system prompt should be prepended to attachment
-    const newContent = fs.readFileSync(attachmentPath, 'utf8');
-    assert.equal(newContent.startsWith(longSystemPrompt + '\n\noriginal content'), true);
-
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  } finally {
-    Object.defineProperty(process, 'platform', originalPlatform);
-  }
-});
-
-test('fixLongAppendSystemPrompt keeps args when command line is short', () => {
-  const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
-  Object.defineProperty(process, 'platform', { value: 'win32' });
-  try {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qodercn-short-'));
-    const attachmentPath = path.join(tempDir, 'prompt.txt');
-    fs.writeFileSync(attachmentPath, 'original content', 'utf8');
-
-    const shortSystemPrompt = 'be helpful';
-    const args = ['--print', '--append-system-prompt', shortSystemPrompt, '--model', 'auto'];
-    const result = fixLongAppendSystemPrompt(args, attachmentPath, 'qoderclicn');
-
-    // args should remain unchanged because total length is below threshold
-    assert.deepEqual(result, args);
-
-    // attachment should remain unchanged
-    const content = fs.readFileSync(attachmentPath, 'utf8');
-    assert.equal(content, 'original content');
-
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  } finally {
-    Object.defineProperty(process, 'platform', originalPlatform);
-  }
+  assert.equal(prompt.includes(longSystemPrompt), true);
+  assert.equal(prompt.includes('"role": "system"'), true);
 });
