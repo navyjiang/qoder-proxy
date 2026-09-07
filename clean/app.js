@@ -71,6 +71,8 @@ function extractRequestOptions(body) {
     reasoningEffort: firstDefined(
       body.reasoningEffort,
       body.reasoning_effort,
+      body.output_config?.effort,
+      body.outputConfig?.effort,
       body.reasoning?.effort,
       body.reasoning?.reasoningEffort,
       body.reasoning?.reasoning_effort,

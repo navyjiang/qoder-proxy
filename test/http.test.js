@@ -280,6 +280,14 @@ test('extracts OpenCode and OpenAI-compatible model options', () => {
     }).reasoningEffort,
     'max'
   );
+
+  // Claude Code sends its effortLevel setting as output_config.effort
+  assert.equal(
+    extractRequestOptions({
+      output_config: { effort: 'high' },
+    }).reasoningEffort,
+    'high'
+  );
 });
 
 test('OpenAI chat completions returns tool_calls when model outputs tool call JSON', async () => {

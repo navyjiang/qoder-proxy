@@ -21,6 +21,7 @@ test('effort alias models have effortAlias: true', () => {
     'qwen3.7-max-effort-low',
     'qwen3.7-max-effort-medium',
     'qwen3.7-max-effort-high',
+    'qwen3.7-max-effort-xhigh',
     'qwen3.7-max-effort-max',
   ];
   for (const id of effortIds) {
@@ -50,6 +51,10 @@ test('resolveModelRoute parses effort suffixes correctly', () => {
   const max = resolveModelRoute('deepseek-v4-pro-effort-max');
   assert.equal(max.baseModelId, 'deepseek-v4-pro');
   assert.equal(max.reasoningEffort, 'max');
+
+  const xhigh = resolveModelRoute('kimi-k3-effort-xhigh');
+  assert.equal(xhigh.baseModelId, 'kimi-k3');
+  assert.equal(xhigh.reasoningEffort, 'xhigh');
 
   const none = resolveModelRoute('qwen3.7-max');
   assert.equal(none.baseModelId, 'qwen3.7-max');

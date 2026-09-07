@@ -5,6 +5,7 @@ const MODELS = [
   { id: 'qwen3.7-max-effort-low', name: 'Qwen3.7-Max low', cliModel: 'Qwen3.7-Max', reasoning: true, effortAlias: true },
   { id: 'qwen3.7-max-effort-medium', name: 'Qwen3.7-Max medium', cliModel: 'Qwen3.7-Max', reasoning: true, effortAlias: true },
   { id: 'qwen3.7-max-effort-high', name: 'Qwen3.7-Max high', cliModel: 'Qwen3.7-Max', reasoning: true, effortAlias: true },
+  { id: 'qwen3.7-max-effort-xhigh', name: 'Qwen3.7-Max xhigh', cliModel: 'Qwen3.7-Max', reasoning: true, effortAlias: true },
   { id: 'qwen3.7-max-effort-max', name: 'Qwen3.7-Max max', cliModel: 'Qwen3.7-Max', reasoning: true, effortAlias: true },
   { id: 'glm-5.2', name: 'GLM-5.2', cliModel: 'GLM-5.2', reasoning: true },
   { id: 'kimi-k3', name: 'Kimi-K3', cliModel: 'Kimi-K3', reasoning: true },
@@ -16,7 +17,7 @@ const MODELS = [
 ];
 
 const DEFAULT_MODEL_ID = 'qoder-cn';
-const EFFORT_SUFFIX_RE = /^(.*)-effort-(low|medium|high|max)$/;
+const EFFORT_SUFFIX_RE = /^(.*)-effort-(low|medium|high|xhigh|max)$/;
 
 function getModel(modelId) {
   return MODELS.find((model) => model.id === modelId);
