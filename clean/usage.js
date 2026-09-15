@@ -15,6 +15,8 @@ const stats = {
   estimatedInputTokens: 0,
   estimatedOutputTokens: 0,
   estimatedTotalTokens: 0,
+  actualInputTokens: 0,
+  actualOutputTokens: 0,
 };
 
 let lastResetDate = getToday();
@@ -46,7 +48,7 @@ function extractTextFromMessages(messages) {
     .join('');
 }
 
-function trackRequest({ model, inputText, outputText, isError }) {
+function trackRequest({ model, inputText, outputText, isError, usage }) {
   const today = getToday();
   if (today !== lastResetDate) {
     stats.requestsToday = 0;
@@ -70,6 +72,12 @@ function trackRequest({ model, inputText, outputText, isError }) {
   stats.estimatedInputTokens += inputTokens;
   stats.estimatedOutputTokens += outputTokens;
   stats.estimatedTotalTokens += inputTokens + outputTokens;
+
+  // Real token counts from the upstream response, when available
+  if (usage) {
+    stats.actualInputTokens += usage.prompt_tokens || 0;
+    stats.actualOutputTokens += usage.completion_tokens || 0;
+  }
 }
 
 function getUsage() {
@@ -84,6 +92,8 @@ function getUsage() {
     estimatedInputTokens: stats.estimatedInputTokens,
     estimatedOutputTokens: stats.estimatedOutputTokens,
     estimatedTotalTokens: stats.estimatedTotalTokens,
+    actualInputTokens: stats.actualInputTokens,
+    actualOutputTokens: stats.actualOutputTokens,
     officialQuota: {
       supported: false,
       message:
@@ -102,6 +112,8 @@ function resetUsage() {
   stats.estimatedInputTokens = 0;
   stats.estimatedOutputTokens = 0;
   stats.estimatedTotalTokens = 0;
+  stats.actualInputTokens = 0;
+  stats.actualOutputTokens = 0;
   lastResetDate = getToday();
 
   // Clear persisted file
@@ -137,6 +149,8 @@ function loadUsage() {
         stats.estimatedInputTokens = data.estimatedInputTokens || 0;
         stats.estimatedOutputTokens = data.estimatedOutputTokens || 0;
         stats.estimatedTotalTokens = data.estimatedTotalTokens || 0;
+        stats.actualInputTokens = data.actualInputTokens || 0;
+        stats.actualOutputTokens = data.actualOutputTokens || 0;
       }
     }
   } catch (_) {

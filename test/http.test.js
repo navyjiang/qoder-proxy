@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const qoderCli = require('../clean/qodercn-cli');
+const qoderApi = require('../clean/qoder-api');
+const { AppError } = require('../clean/errors');
 const { createApp, extractRequestOptions } = require('../clean/app');
 
 function listen(app) {
@@ -12,7 +13,26 @@ function listen(app) {
   });
 }
 
-test('health and models endpoints are OpenAI-compatible enough for discovery', async () => {
+const originalCompletion = qoderApi.chatCompletion;
+
+function restore() {
+  qoderApi.chatCompletion = originalCompletion;
+}
+
+function makeCompletion(overrides = {}) {
+  return {
+    id: 'chatcmpl-t',
+    model: 'kmodel_latest',
+    content: '',
+    reasoning: '',
+    toolCalls: [],
+    finishReason: 'stop',
+    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    ...overrides,
+  };
+}
+
+test('health and models endpoints work', async () => {
   const { server, baseUrl } = await listen(createApp());
   try {
     const health = await fetch(`${baseUrl}/health`);
@@ -23,143 +43,148 @@ test('health and models endpoints are OpenAI-compatible enough for discovery', a
     assert.equal(models.status, 200);
     const body = await models.json();
     assert.equal(body.object, 'list');
-    assert.equal(body.data[0].id, 'qoder-cn');
-    assert.equal(body.data.some((model) => model.id === 'qwen3.7-max'), true);
-    assert.equal(body.data.some((model) => model.id === 'deepseek-v4-flash'), true);
+    assert.equal(body.data.some((model) => model.id === 'kimi-k3'), true);
+    assert.equal(body.data.some((model) => model.id === 'kimi-k3-effort-high'), true);
   } finally {
     server.close();
   }
 });
 
-test('streaming returns OpenAI-compatible SSE chunks', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  const originalStream = qoderCli.runQoderCnCliStream;
-  qoderCli.runQoderCnCliStream = async ({ onDelta }) => {
-    onDelta('OK');
-    return 'OK';
-  };
+test('OpenAI streaming forwards synthesized chunks with the public model id', async () => {
+  qoderApi.chatCompletion = async () => makeCompletion({ content: 'Hello world' });
   const { server, baseUrl } = await listen(createApp());
   try {
-    const streaming = await fetch(`${baseUrl}/v1/chat/completions`, {
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      body: JSON.stringify({ model: 'kimi-k3', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
     });
-    assert.equal(streaming.status, 200);
-    assert.match(streaming.headers.get('content-type'), /text\/event-stream/);
-    const text = await streaming.text();
-    assert.match(text, /"object":"chat\.completion\.chunk"/);
-    assert.match(text, /"content":"OK"/);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-type'), /text\/event-stream/);
+    const text = await response.text();
+    assert.match(text, /"content":"Hello world"/);
+    assert.match(text, /"model":"kimi-k3"/);
+    assert.equal(text.includes('kmodel_latest'), false);
+    assert.match(text, /"finish_reason":"stop"/);
     assert.match(text, /data: \[DONE\]/);
   } finally {
-    qoderCli.runQoderCnCli = originalRun;
-    qoderCli.runQoderCnCliStream = originalStream;
+    restore();
     server.close();
   }
 });
 
-test('true streaming forwards multiple deltas in real time', async () => {
-  const originalStream = qoderCli.runQoderCnCliStream;
-  qoderCli.runQoderCnCliStream = async ({ onDelta }) => {
-    onDelta('Hello ');
-    onDelta('world');
-    onDelta('!');
-    return 'Hello world!';
-  };
+test('OpenAI non-streaming assembles tool_calls from the completion', async () => {
+  qoderApi.chatCompletion = async () => ({
+    id: 'chatcmpl-t',
+    model: 'kmodel_latest',
+    content: '',
+    reasoning: '',
+    toolCalls: [{ id: 'call_1', name: 'Read', arguments: '{"file_path":"/tmp/x"}' }],
+    finishReason: 'tool_calls',
+    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+  });
   const { server, baseUrl } = await listen(createApp());
   try {
-    const streaming = await fetch(`${baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, messages: [{ role: 'user', content: 'hi' }] }),
-    });
-    assert.equal(streaming.status, 200);
-    const text = await streaming.text();
-    // Each delta should appear as a separate SSE chunk
-    const deltaMatches = text.match(/"content":"[^"]+"/g) || [];
-    assert.equal(deltaMatches.length, 3);
-    assert.match(deltaMatches[0], /"content":"Hello "/);
-    assert.match(deltaMatches[1], /"content":"world"/);
-    assert.match(deltaMatches[2], /"content":"!"/);
-    assert.match(text, /data: \[DONE\]/);
-  } finally {
-    qoderCli.runQoderCnCliStream = originalStream;
-    server.close();
-  }
-});
-
-test('tool call messages are accepted (no longer rejected)', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  qoderCli.runQoderCnCli = async () => 'I will help you.';
-  const { server, baseUrl } = await listen(createApp());
-  try {
-    // Messages with tool_calls in history should now be accepted
-    const toolCall = await fetch(`${baseUrl}/v1/chat/completions`, {
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        messages: [
-          { role: 'user', content: 'read file' },
-          { role: 'assistant', content: '', tool_calls: [{ id: 'call_x', type: 'function', function: { name: 'read_file', arguments: '{"path":"/tmp/x"}' } }] },
-          { role: 'tool', tool_call_id: 'call_x', content: 'file contents here' },
-          { role: 'user', content: 'what was in the file?' },
-        ],
+        model: 'kimi-k3',
+        messages: [{ role: 'user', content: 'read /tmp/x' }],
+        tools: [{ type: 'function', function: { name: 'Read', description: 'Read', parameters: { type: 'object' } } }],
       }),
     });
-    assert.equal(toolCall.status, 200);
-    const body = await toolCall.json();
+    assert.equal(response.status, 200);
+    const body = await response.json();
     assert.equal(body.object, 'chat.completion');
-    assert.equal(body.choices[0].message.role, 'assistant');
+    assert.equal(body.model, 'kimi-k3');
+    assert.equal(body.choices[0].finish_reason, 'tool_calls');
+    assert.equal(body.choices[0].message.tool_calls[0].function.name, 'Read');
+    assert.equal(body.choices[0].message.tool_calls[0].function.arguments, '{"file_path":"/tmp/x"}');
+    assert.deepEqual(body.usage, { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
   } finally {
-    qoderCli.runQoderCnCli = originalRun;
+    restore();
     server.close();
   }
 });
 
-test('anthropic messages endpoint with tools injects tool definitions', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  let captured;
-  qoderCli.runQoderCnCli = async (input) => {
-    captured = input;
-    return 'OK';
-  };
+test('Anthropic streaming converts a buffered completion to Anthropic SSE', async () => {
+  qoderApi.chatCompletion = async () => makeCompletion({
+    content: 'Let me read.',
+    reasoning: 'hmm',
+    toolCalls: [{ id: 'call_1', name: 'Read', arguments: '{"file_path":"/tmp/x"}', index: 0 }],
+    finishReason: 'tool_calls',
+    usage: { prompt_tokens: 3, completion_tokens: 9, total_tokens: 12 },
+  });
   const { server, baseUrl } = await listen(createApp());
   try {
     const response = await fetch(`${baseUrl}/v1/messages`, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'anthropic-version': '2023-06-01',
-        'x-api-key': 'not-used',
-      },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'qwen3.7-max',
-        max_tokens: 32,
-        system: 'Be terse.',
-        tools: [{ name: 'Read', input_schema: { type: 'object' } }],
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        model: 'kimi-k3',
+        max_tokens: 1024,
+        stream: true,
+        tools: [{ name: 'Read', description: 'Read', input_schema: { type: 'object' } }],
+        messages: [{ role: 'user', content: 'read /tmp/x' }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.match(text, /event: message_start/);
+    assert.match(text, /"type":"thinking_delta","thinking":"hmm"/);
+    assert.match(text, /"type":"text_delta","text":"Let me read\."/);
+    assert.match(text, /"type":"tool_use","id":"call_1","name":"Read"/);
+    assert.match(text, /"type":"input_json_delta","partial_json":"\{\\"file_path\\":\\"\/tmp\/x\\"\}"/);
+    assert.match(text, /"stop_reason":"tool_use"/);
+    assert.match(text, /"output_tokens":9/);
+    assert.match(text, /event: message_stop/);
+  } finally {
+    restore();
+    server.close();
+  }
+});
+
+test('Anthropic non-streaming returns message JSON with tool_use blocks', async () => {
+  qoderApi.chatCompletion = async () => ({
+    id: 'chatcmpl-t',
+    model: 'kmodel_latest',
+    content: 'Reading it.',
+    reasoning: '',
+    toolCalls: [{ id: 'call_9', name: 'Read', arguments: '{"file_path":"/tmp/x"}' }],
+    finishReason: 'tool_calls',
+    usage: { prompt_tokens: 3, completion_tokens: 9, total_tokens: 12 },
+  });
+  const { server, baseUrl } = await listen(createApp());
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'kimi-k3',
+        max_tokens: 1024,
+        tools: [{ name: 'Read', description: 'Read', input_schema: { type: 'object' } }],
+        messages: [{ role: 'user', content: 'read /tmp/x' }],
       }),
     });
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(body.type, 'message');
-    assert.equal(body.role, 'assistant');
-    assert.deepEqual(body.content, [{ type: 'text', text: 'OK' }]);
-    // Tools should be injected as system prompt, not "text-only" warning
-    assert.equal(captured.messages.some((message) => /tool_calls/.test(message.content)), true);
-    assert.equal(captured.messages.some((message) => /text-only/.test(message.content)), false);
+    assert.equal(body.stop_reason, 'tool_use');
+    assert.deepEqual(body.content[0], { type: 'text', text: 'Reading it.' });
+    assert.equal(body.content[1].type, 'tool_use');
+    assert.equal(body.content[1].id, 'call_9');
+    assert.deepEqual(body.content[1].input, { file_path: '/tmp/x' });
+    assert.deepEqual(body.usage, { input_tokens: 3, output_tokens: 9 });
   } finally {
-    qoderCli.runQoderCnCli = originalRun;
+    restore();
     server.close();
   }
 });
 
-test('anthropic messages endpoint streams Anthropic SSE events', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  const originalStream = qoderCli.runQoderCnCliStream;
-  qoderCli.runQoderCnCliStream = async ({ onDelta }) => {
-    onDelta('OK');
-    return 'OK';
+test('upstream errors surface as an Anthropic SSE error event', async () => {
+  qoderApi.chatCompletion = async () => {
+    throw new AppError(502, 'upstream_error', 'model server exploded');
   };
   const { server, baseUrl } = await listen(createApp());
   try {
@@ -167,31 +192,84 @@ test('anthropic messages endpoint streams Anthropic SSE events', async () => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'qwen3.7-max',
+        model: 'kimi-k3',
         max_tokens: 32,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
     });
     assert.equal(response.status, 200);
-    assert.match(response.headers.get('content-type'), /text\/event-stream/);
     const text = await response.text();
-    assert.match(text, /event: message_start/);
-    assert.match(text, /"type":"text_delta","text":"OK"/);
-    assert.match(text, /event: message_stop/);
+    assert.match(text, /event: error/);
+    assert.match(text, /model server exploded/);
   } finally {
-    qoderCli.runQoderCnCli = originalRun;
-    qoderCli.runQoderCnCliStream = originalStream;
+    restore();
     server.close();
   }
 });
 
-test('anthropic true streaming forwards multiple deltas', async () => {
-  const originalStream = qoderCli.runQoderCnCliStream;
-  qoderCli.runQoderCnCliStream = async ({ onDelta }) => {
-    onDelta('Hello ');
-    onDelta('world');
-    return 'Hello world';
+test('upstream errors on non-streaming return an OpenAI error body', async () => {
+  qoderApi.chatCompletion = async () => {
+    throw new AppError(401, 'cli_token_missing', 'No stored Qoder credentials found.', 'authentication_error');
+  };
+  const { server, baseUrl } = await listen(createApp());
+  try {
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(response.status, 401);
+    const body = await response.json();
+    assert.match(body.error.message, /No stored Qoder credentials/);
+  } finally {
+    restore();
+    server.close();
+  }
+});
+
+test('tool role messages and assistant tool_calls history are accepted', async () => {
+  let captured;
+  qoderApi.chatCompletion = async (options) => {
+    captured = options;
+    return {
+      id: 'chatcmpl-t', model: 'kmodel_latest', content: 'done', reasoning: '',
+      toolCalls: [], finishReason: 'stop', usage: null,
+    };
+  };
+  const { server, baseUrl } = await listen(createApp());
+  try {
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messages: [
+          { role: 'user', content: 'read file' },
+          { role: 'assistant', content: '', tool_calls: [{ id: 'call_x', type: 'function', function: { name: 'Read', arguments: '{"path":"/tmp/x"}' } }] },
+          { role: 'tool', tool_call_id: 'call_x', content: 'file contents here' },
+          { role: 'user', content: 'what was in the file?' },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    // Messages are forwarded natively — no prompt re-serialization
+    assert.equal(captured.messages.length, 4);
+    assert.equal(captured.messages[2].role, 'tool');
+    assert.equal(captured.messages[2].tool_call_id, 'call_x');
+  } finally {
+    restore();
+    server.close();
+  }
+});
+
+test('anthropic tool_use/tool_result history converts to native OpenAI messages', async () => {
+  let captured;
+  qoderApi.chatCompletion = async (options) => {
+    captured = options;
+    return {
+      id: 'chatcmpl-t', model: 'kmodel_latest', content: 'It says hello.', reasoning: '',
+      toolCalls: [], finishReason: 'stop', usage: null,
+    };
   };
   const { server, baseUrl } = await listen(createApp());
   try {
@@ -199,26 +277,26 @@ test('anthropic true streaming forwards multiple deltas', async () => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'qwen3.7-max',
+        model: 'kimi-k3',
         max_tokens: 32,
-        stream: true,
-        messages: [{ role: 'user', content: 'hi' }],
+        messages: [
+          { role: 'user', content: 'read /tmp/x' },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: '/tmp/x' } }],
+          },
+          {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'hello' }],
+          },
+        ],
       }),
     });
     assert.equal(response.status, 200);
-    const text = await response.text();
-    assert.match(text, /event: message_start/);
-    assert.match(text, /event: content_block_start/);
-    // Each delta should appear as a separate content_block_delta
-    const deltaMatches = text.match(/event: content_block_delta/g) || [];
-    assert.equal(deltaMatches.length, 2);
-    assert.match(text, /"text":"Hello "/);
-    assert.match(text, /"text":"world"/);
-    assert.match(text, /event: content_block_stop/);
-    assert.match(text, /event: message_delta/);
-    assert.match(text, /event: message_stop/);
+    assert.equal(captured.messages[1].tool_calls[0].function.name, 'Read');
+    assert.deepEqual(captured.messages[2], { role: 'tool', tool_call_id: 'toolu_1', content: 'hello' });
   } finally {
-    qoderCli.runQoderCnCliStream = originalStream;
+    restore();
     server.close();
   }
 });
@@ -230,7 +308,7 @@ test('anthropic count_tokens returns an approximate input token count', async ()
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'qwen3.7-max',
+        model: 'kimi-k3',
         messages: [{ role: 'user', content: 'hello world' }],
       }),
     });
@@ -288,159 +366,4 @@ test('extracts OpenCode and OpenAI-compatible model options', () => {
     }).reasoningEffort,
     'high'
   );
-});
-
-test('OpenAI chat completions returns tool_calls when model outputs tool call JSON', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  qoderCli.runQoderCnCli = async () => '```json\n{"tool_calls": [{"name": "read_file", "arguments": {"path": "/tmp/test.txt"}}]}\n```';
-  const { server, baseUrl } = await listen(createApp());
-  try {
-    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: 'qwen3.7-max',
-        messages: [{ role: 'user', content: 'read /tmp/test.txt' }],
-        tools: [{ type: 'function', function: { name: 'read_file', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } } }],
-      }),
-    });
-    assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.object, 'chat.completion');
-    assert.equal(body.choices[0].message.role, 'assistant');
-    assert.equal(body.choices[0].finish_reason, 'tool_calls');
-    assert.ok(body.choices[0].message.tool_calls);
-    assert.equal(body.choices[0].message.tool_calls.length, 1);
-    assert.equal(body.choices[0].message.tool_calls[0].type, 'function');
-    assert.equal(body.choices[0].message.tool_calls[0].function.name, 'read_file');
-    // arguments must be a JSON string per OpenAI spec
-    assert.equal(typeof body.choices[0].message.tool_calls[0].function.arguments, 'string');
-    const args = JSON.parse(body.choices[0].message.tool_calls[0].function.arguments);
-    assert.equal(args.path, '/tmp/test.txt');
-    assert.ok(body.choices[0].message.tool_calls[0].id.startsWith('call_'));
-  } finally {
-    qoderCli.runQoderCnCli = originalRun;
-    server.close();
-  }
-});
-
-test('OpenAI chat completions falls back to text when model outputs plain text with tools', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  qoderCli.runQoderCnCli = async () => 'I cannot find that file.';
-  const { server, baseUrl } = await listen(createApp());
-  try {
-    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: 'qwen3.7-max',
-        messages: [{ role: 'user', content: 'read /tmp/missing.txt' }],
-        tools: [{ type: 'function', function: { name: 'read_file', description: 'Read a file', parameters: { type: 'object' } } }],
-      }),
-    });
-    assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.choices[0].finish_reason, 'stop');
-    assert.equal(body.choices[0].message.content, 'I cannot find that file.');
-    assert.equal(body.choices[0].message.tool_calls, undefined);
-  } finally {
-    qoderCli.runQoderCnCli = originalRun;
-    server.close();
-  }
-});
-
-test('Anthropic messages endpoint returns tool_use blocks when model outputs tool call JSON', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  qoderCli.runQoderCnCli = async () => '```json\n{"tool_calls": [{"name": "Read", "arguments": {"path": "/tmp/test.txt"}}]}\n```';
-  const { server, baseUrl } = await listen(createApp());
-  try {
-    const response = await fetch(`${baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: 'qwen3.7-max',
-        max_tokens: 1024,
-        tools: [{ name: 'Read', description: 'Read a file', input_schema: { type: 'object', properties: { path: { type: 'string' } } } }],
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'read /tmp/test.txt' }] }],
-      }),
-    });
-    assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.type, 'message');
-    assert.equal(body.stop_reason, 'tool_use');
-    // Should have a tool_use content block
-    const toolUseBlocks = body.content.filter((b) => b.type === 'tool_use');
-    assert.equal(toolUseBlocks.length, 1);
-    assert.equal(toolUseBlocks[0].name, 'Read');
-    // Anthropic: input is a parsed object, not a JSON string
-    assert.deepEqual(toolUseBlocks[0].input, { path: '/tmp/test.txt' });
-    assert.ok(toolUseBlocks[0].id.startsWith('toolu_'));
-  } finally {
-    qoderCli.runQoderCnCli = originalRun;
-    server.close();
-  }
-});
-
-test('Anthropic messages endpoint returns mixed text+tool_use when model outputs text before tool JSON', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  qoderCli.runQoderCnCli = async () => 'Let me read that file for you.\n```json\n{"tool_calls": [{"name": "Read", "arguments": {"path": "/tmp/x"}}]}\n```';
-  const { server, baseUrl } = await listen(createApp());
-  try {
-    const response = await fetch(`${baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: 'qwen3.7-max',
-        max_tokens: 1024,
-        tools: [{ name: 'Read', description: 'Read a file', input_schema: { type: 'object', properties: { path: { type: 'string' } } } }],
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'read /tmp/x' }] }],
-      }),
-    });
-    assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.stop_reason, 'tool_use');
-    const textBlocks = body.content.filter((b) => b.type === 'text');
-    const toolUseBlocks = body.content.filter((b) => b.type === 'tool_use');
-    // Should have both text and tool_use
-    assert.equal(textBlocks.length, 1);
-    assert.equal(textBlocks[0].text, 'Let me read that file for you.');
-    assert.equal(toolUseBlocks.length, 1);
-    assert.equal(toolUseBlocks[0].name, 'Read');
-  } finally {
-    qoderCli.runQoderCnCli = originalRun;
-    server.close();
-  }
-});
-
-test('OpenAI chat completions with tool role messages formats tool results in prompt', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  let captured;
-  qoderCli.runQoderCnCli = async (input) => {
-    captured = input;
-    return 'The file says hello.';
-  };
-  const { server, baseUrl } = await listen(createApp());
-  try {
-    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        messages: [
-          { role: 'user', content: 'read /tmp/test.txt' },
-          { role: 'assistant', content: '', tool_calls: [{ id: 'call_abc', type: 'function', function: { name: 'read_file', arguments: '{"path":"/tmp/test.txt"}' } }] },
-          { role: 'tool', tool_call_id: 'call_abc', content: 'hello world' },
-          { role: 'user', content: 'what did the file say?' },
-        ],
-      }),
-    });
-    assert.equal(response.status, 200);
-    // Verify that tool result was formatted with its call ID in the prompt
-    assert.ok(captured);
-    const toolMessage = captured.messages.find((m) => m.role === 'tool');
-    assert.ok(toolMessage);
-    assert.equal(toolMessage.tool_call_id, 'call_abc');
-  } finally {
-    qoderCli.runQoderCnCli = originalRun;
-    server.close();
-  }
 });

@@ -2,33 +2,27 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
+const path = require('path');
 const { anthropicError, openAiError, AppError } = require('./errors');
 const { log } = require('./logger');
-const qoderCli = require('./qodercn-cli');
-const { DEFAULT_MODEL_ID, MODELS } = require('./models');
+const qoderApi = require('./qoder-api');
+const { DEFAULT_MODEL_ID, MODELS, resolveModelRoute } = require('./models');
 const {
   anthropicToOpenAiMessages,
   createAnthropicMessage,
+  createAnthropicStreamWriter,
   estimateAnthropicInputTokens,
   validateAnthropicMessagesRequest,
-  writeAnthropicMessageStream,
   writeAnthropicSse,
 } = require('./anthropic');
-const {
-  parseToolCallOutput,
-  generateCallId,
-  normalizeOpenAiTools,
-  normalizeAnthropicTools,
-  formatToolResultForPrompt,
-} = require('./tool-parser');
-const path = require('path');
-const { trackRequest, getUsage, resetUsage, saveUsage, extractTextFromMessages } = require('./usage');
-const { executeToolCall } = require('./tools-executor');
+const { trackRequest, getUsage, resetUsage, extractTextFromMessages } = require('./usage');
 
 const MODEL_ID = DEFAULT_MODEL_ID;
 // Claude Code-style clients resend the full conversation history on every
 // request, which easily exceeds 1MB for resumed sessions. Default to 25mb.
 const BODY_LIMIT = process.env.QODERCN_BODY_LIMIT || '25mb';
+const DEFAULT_TIMEOUT_MS = 300000;
 
 function validateChatRequest(body) {
   if (!body || typeof body !== 'object') {
@@ -41,7 +35,6 @@ function validateChatRequest(body) {
     if (!message || typeof message !== 'object') {
       throw new AppError(400, 'invalid_messages', 'Each message must be an object.');
     }
-    // Allow system, user, assistant, and tool roles for multi-turn tool use
     if (!['system', 'user', 'assistant', 'tool'].includes(message.role)) {
       throw new AppError(400, 'unsupported_role', `Unsupported message role: ${message.role}`);
     }
@@ -96,62 +89,22 @@ function extractRequestOptions(body) {
   };
 }
 
-function createChatCompletion({ model, content, parsedOutput }) {
-  // If the CLI output was parsed as tool calls, return OpenAI tool_calls format
-  if (parsedOutput && parsedOutput.type === 'tool_calls') {
-    return {
-      id: `chatcmpl-${Date.now()}`,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [
-        {
-          index: 0,
-          message: {
-            role: 'assistant',
-            content: parsedOutput.prefixText || null,
-            tool_calls: parsedOutput.toolCalls.map((call) => ({
-              id: generateCallId('call_'),
-              type: 'function',
-              function: {
-                name: call.name,
-                // OpenAI spec: arguments is a JSON string, not a parsed object
-                arguments: JSON.stringify(call.arguments),
-              },
-            })),
-          },
-          finish_reason: 'tool_calls',
-        },
-      ],
-      usage: {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-      },
-    };
-  }
-
-  // Regular text response
+// Resolve the public model id + request options into upstream call options.
+function resolveUpstreamOptions(modelId, requestOptions) {
+  const route = resolveModelRoute(modelId);
+  const reasoningEffort = requestOptions.reasoningEffort
+    || route.reasoningEffort
+    || process.env.QODERCN_REASONING_EFFORT
+    || undefined;
+  const maxOutputTokens = requestOptions.maxOutputTokens
+    || (process.env.QODERCN_MAX_OUTPUT_TOKENS ? Number(process.env.QODERCN_MAX_OUTPUT_TOKENS) : undefined)
+    || undefined;
+  log('resolved server model', { model: modelId, serverModel: route.serverModel });
   return {
-    id: `chatcmpl-${Date.now()}`,
-    object: 'chat.completion',
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [
-      {
-        index: 0,
-        message: {
-          role: 'assistant',
-          content,
-        },
-        finish_reason: 'stop',
-      },
-    ],
-    usage: {
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
-    },
+    model: route.serverModel,
+    reasoningEffort,
+    maxOutputTokens,
+    contextWindow: requestOptions.contextWindow || undefined,
   };
 }
 
@@ -159,61 +112,80 @@ function writeSse(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
-function writeChatCompletionStream(res, { model, content }) {
-  const id = `chatcmpl-${Date.now()}`;
-  const created = Math.floor(Date.now() / 1000);
+// Convert a buffered completion into a synthetic OpenAI chunk sequence, so
+// downstream clients still receive a well-formed SSE stream even though the
+// upstream call is buffered (see buildRequestBody for why).
+function completionToChunks(completion) {
+  const chunks = [{ choices: [{ index: 0, delta: { role: 'assistant' } }] }];
+  if (completion.reasoning) {
+    chunks.push({ choices: [{ index: 0, delta: { reasoning_content: completion.reasoning } }] });
+  }
+  if (completion.content) {
+    chunks.push({ choices: [{ index: 0, delta: { content: completion.content } }] });
+  }
+  for (const call of completion.toolCalls) {
+    chunks.push({
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: call.index,
+            id: call.id || undefined,
+            type: 'function',
+            function: { name: call.name, arguments: call.arguments },
+          }],
+        },
+      }],
+    });
+  }
+  chunks.push({
+    choices: [{ index: 0, delta: {}, finish_reason: completion.finishReason, usage: completion.usage || undefined }],
+  });
+  return chunks;
+}
 
+function sseHeaders(res) {
   res.status(200);
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
+}
 
-  writeSse(res, {
-    id,
-    object: 'chat.completion.chunk',
-    created,
-    model,
-    choices: [
-      {
-        index: 0,
-        delta: { role: 'assistant' },
-        finish_reason: null,
-      },
-    ],
-  });
+function makeTimeoutSignal(controller) {
+  const timeoutMs = Number(process.env.QODERCN_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return () => clearTimeout(timer);
+}
 
-  if (content) {
-    writeSse(res, {
-      id,
-      object: 'chat.completion.chunk',
-      created,
-      model,
-      choices: [
-        {
-          index: 0,
-          delta: { content },
-          finish_reason: null,
-        },
-      ],
-    });
+function createChatCompletionJson({ model, completion }) {
+  const message = { role: 'assistant', content: completion.content || null };
+  if (completion.toolCalls.length) {
+    message.tool_calls = completion.toolCalls.map((call) => ({
+      id: call.id || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+      type: 'function',
+      function: { name: call.name, arguments: call.arguments || '{}' },
+    }));
   }
-
-  writeSse(res, {
-    id,
-    object: 'chat.completion.chunk',
-    created,
+  return {
+    id: completion.id,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
     model,
     choices: [
       {
         index: 0,
-        delta: {},
-        finish_reason: 'stop',
+        message,
+        finish_reason: completion.finishReason || 'stop',
       },
     ],
-  });
-  res.write('data: [DONE]\n\n');
-  res.end();
+    usage: {
+      prompt_tokens: completion.usage?.prompt_tokens || 0,
+      completion_tokens: completion.usage?.completion_tokens || 0,
+      total_tokens: completion.usage?.total_tokens
+        || (completion.usage?.prompt_tokens || 0) + (completion.usage?.completion_tokens || 0),
+    },
+  };
 }
 
 function createApp() {
@@ -227,14 +199,14 @@ function createApp() {
   });
 
   app.get('/', (_req, res) => {
-    const backend = qoderCli.getCliBackend();
+    const backend = qoderApi.getBackend();
     res.json({
       ok: true,
       name: 'qoder-proxy',
-      mode: 'clean',
+      mode: 'direct',
       cli_backend: backend.name,
-      cli_command: backend.command,
-      cli_home: backend.homeDir,
+      model_host: backend.modelHost,
+      auth_home: backend.authDir,
     });
   });
 
@@ -245,7 +217,7 @@ function createApp() {
         id: model.id,
         object: 'model',
         created: 0,
-        owned_by: 'qodercn',
+        owned_by: 'qoder',
         name: model.name,
         capabilities: {
           reasoning: model.reasoning || false,
@@ -259,64 +231,57 @@ function createApp() {
     const started = Date.now();
     const controller = new AbortController();
     req.on('aborted', () => controller.abort());
+    const clearTimer = makeTimeoutSignal(controller);
 
     try {
       validateChatRequest(req.body);
       const model = req.body.model || MODEL_ID;
       const requestOptions = extractRequestOptions(req.body);
-      const tools = Array.isArray(req.body.tools) ? req.body.tools : null;
-      const normalizedTools = tools ? normalizeOpenAiTools(tools) : null;
+      const upstream = resolveUpstreamOptions(model, requestOptions);
       log('chat request accepted', {
         model,
         message_count: req.body.messages.length,
         stream: Boolean(req.body.stream),
-        tool_count: normalizedTools ? normalizedTools.length : 0,
-        reasoning_effort: requestOptions.reasoningEffort,
+        tool_count: Array.isArray(req.body.tools) ? req.body.tools.length : 0,
+        reasoning_effort: upstream.reasoningEffort,
       });
 
-      // True streaming: stream-json mode, real-time SSE forwarding
+      const callOptions = {
+        messages: req.body.messages,
+        tools: Array.isArray(req.body.tools) ? req.body.tools : null,
+        signal: controller.signal,
+        rootDir: process.cwd(),
+        ...upstream,
+      };
+
       if (req.body.stream) {
-        const id = `chatcmpl-${Date.now()}`;
-        const created = Math.floor(Date.now() / 1000);
-
-        res.status(200);
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache, no-transform');
-        res.setHeader('Connection', 'keep-alive');
-        res.flushHeaders?.();
-
-        // Send role chunk first
-        writeSse(res, {
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-        });
-
+        sseHeaders(res);
         try {
-          await qoderCli.runQoderCnCliStream({
-            messages: req.body.messages,
-            model,
-            tools: normalizedTools,
-            reasoningEffort: requestOptions.reasoningEffort,
-            contextWindow: requestOptions.contextWindow,
-            maxOutputTokens: requestOptions.maxOutputTokens,
-            signal: controller.signal,
-            onDelta: (delta) => {
-              writeSse(res, {
-                id,
-                object: 'chat.completion.chunk',
-                created,
-                model,
-                choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-              });
-            },
-          });
+          const completion = await qoderApi.chatCompletion(callOptions);
+          const created = Math.floor(Date.now() / 1000);
+          for (const chunk of completionToChunks(completion)) {
+            writeSse(res, {
+              id: completion.id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              ...chunk,
+            });
+          }
+          res.write('data: [DONE]\n\n');
+          res.end();
         } catch (streamError) {
-          // If headers are already sent, we can only log and end the stream
           if (!res.writableEnded) {
-            try { res.end(); } catch (_) { /* ignore */ }
+            try {
+              writeSse(res, {
+                error: {
+                  message: streamError.message || 'Upstream request failed.',
+                  type: streamError.code || 'api_error',
+                },
+              });
+              res.write('data: [DONE]\n\n');
+              res.end();
+            } catch { /* ignore */ }
           }
           log('chat stream failed', {
             code: streamError.code || 'internal_error',
@@ -326,16 +291,6 @@ function createApp() {
           });
           return;
         }
-
-        writeSse(res, {
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-        });
-        res.write('data: [DONE]\n\n');
-        res.end();
         log('chat stream completed', { duration_ms: Date.now() - started });
         trackRequest({
           model,
@@ -346,107 +301,15 @@ function createApp() {
         return;
       }
 
-      // Non-streaming path (or tool calls with stream=true → downgraded)
-      // Build working messages for potential tool-call loops
-      let workingMessages = [...req.body.messages];
-      let finalContent = '';
-      let finalParsedOutput = null;
-      let toolCallDepth = 0;
-      const MAX_TOOL_CALL_DEPTH = 10;
-
-      while (toolCallDepth < MAX_TOOL_CALL_DEPTH) {
-        const content = await qoderCli.runQoderCnCli({
-          messages: workingMessages,
-          model,
-          tools: normalizedTools,
-          reasoningEffort: requestOptions.reasoningEffort,
-          contextWindow: requestOptions.contextWindow,
-          maxOutputTokens: requestOptions.maxOutputTokens,
-          signal: controller.signal,
-        });
-
-        finalContent = content;
-
-        // Parse the output for tool calls if tools were provided
-        let parsedOutput = null;
-        if (normalizedTools) {
-          parsedOutput = parseToolCallOutput(content);
-          if (parsedOutput && parsedOutput.type === 'tool_calls') {
-            log('chat tool calls detected', {
-              tool_count: parsedOutput.toolCalls.length,
-              tools: parsedOutput.toolCalls.map((t) => t.name),
-            });
-          } else {
-            log('chat no tool calls detected', { response_type: parsedOutput?.type || 'text' });
-          }
-        }
-
-        finalParsedOutput = parsedOutput;
-
-        // If no tool calls, we're done
-        if (!parsedOutput || parsedOutput.type !== 'tool_calls') {
-          break;
-        }
-
-        // Execute tool calls and build tool result messages
-        const toolResults = [];
-        const assistantToolCalls = [];
-
-        for (const toolCall of parsedOutput.toolCalls) {
-          const callId = generateCallId('call_');
-          assistantToolCalls.push({
-            id: callId,
-            type: 'function',
-            function: {
-              name: toolCall.name,
-              arguments: JSON.stringify(toolCall.arguments || {}),
-            },
-          });
-
-          log('executing tool', { name: toolCall.name, arguments: toolCall.arguments });
-          const result = await executeToolCall(toolCall);
-          log('tool result', { name: toolCall.name, result });
-
-          toolResults.push({
-            role: 'tool',
-            tool_call_id: callId,
-            content: JSON.stringify(result),
-          });
-        }
-
-        // Add assistant message with tool_calls
-        workingMessages.push({
-          role: 'assistant',
-          content: parsedOutput.prefixText || null,
-          tool_calls: assistantToolCalls,
-        });
-
-        // Add tool result messages
-        workingMessages.push(...toolResults);
-
-        toolCallDepth++;
-      }
-
-      if (toolCallDepth >= MAX_TOOL_CALL_DEPTH) {
-        log('warning: max tool call depth reached', { depth: MAX_TOOL_CALL_DEPTH });
-      }
-
-      if (req.body.stream) {
-        // Tool calls are not streamed — downgrade to non-streaming response
-        if (finalParsedOutput && finalParsedOutput.type === 'tool_calls') {
-          res.json(createChatCompletion({ model, content: finalContent, parsedOutput: finalParsedOutput }));
-        } else {
-          writeChatCompletionStream(res, { model, content: finalContent });
-        }
-      } else {
-        res.json(createChatCompletion({ model, content: finalContent, parsedOutput: finalParsedOutput }));
-      }
-      log('chat request completed', { duration_ms: Date.now() - started, tool_call_depth: toolCallDepth });
+      const completion = await qoderApi.chatCompletion(callOptions);
+      res.json(createChatCompletionJson({ model, completion }));
+      log('chat request completed', { duration_ms: Date.now() - started });
       trackRequest({
         model,
         inputText: extractTextFromMessages(req.body.messages),
-        outputText: finalContent || '',
+        outputText: completion.content || '',
         isError: false,
+        usage: completion.usage,
       });
     } catch (error) {
       log('chat request failed', {
@@ -462,6 +325,8 @@ function createApp() {
         isError: true,
       });
       if (!res.headersSent && !res.writableEnded) openAiError(res, error);
+    } finally {
+      clearTimer();
     }
   });
 
@@ -469,80 +334,58 @@ function createApp() {
     const started = Date.now();
     const controller = new AbortController();
     req.on('aborted', () => controller.abort());
+    const clearTimer = makeTimeoutSignal(controller);
 
     try {
       validateAnthropicMessagesRequest(req.body);
       const model = req.body.model || MODEL_ID;
       const requestOptions = extractRequestOptions(req.body);
+      if (!requestOptions.maxOutputTokens && req.body.max_tokens) {
+        requestOptions.maxOutputTokens = req.body.max_tokens;
+      }
+      const upstream = resolveUpstreamOptions(model, requestOptions);
       const { messages, tools } = anthropicToOpenAiMessages(req.body);
       log('anthropic message request accepted', {
         model,
         message_count: req.body.messages.length,
         stream: Boolean(req.body.stream),
-        tool_count: Array.isArray(req.body.tools) ? req.body.tools.length : 0,
-        reasoning_effort: requestOptions.reasoningEffort,
+        tool_count: tools ? tools.length : 0,
+        reasoning_effort: upstream.reasoningEffort,
       });
 
-      // True streaming: stream-json mode, real-time SSE forwarding
+      const callOptions = {
+        messages,
+        tools,
+        signal: controller.signal,
+        rootDir: process.cwd(),
+        ...upstream,
+      };
+
       if (req.body.stream) {
-        const msgId = `msg_${Date.now()}`;
-
-        res.status(200);
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache, no-transform');
-        res.setHeader('Connection', 'keep-alive');
-        res.flushHeaders?.();
-
-        writeAnthropicSse(res, 'message_start', {
-          type: 'message_start',
-          message: {
-            id: msgId,
-            type: 'message',
-            role: 'assistant',
-            model,
-            content: [],
-            stop_reason: null,
-            stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
-          },
-        });
-        writeAnthropicSse(res, 'content_block_start', {
-          type: 'content_block_start',
-          index: 0,
-          content_block: { type: 'text', text: '' },
-        });
-
+        sseHeaders(res);
+        const writer = createAnthropicStreamWriter(res, { model });
         try {
-          await qoderCli.runQoderCnCliStream({
-            messages,
-            model,
-            tools,
-            reasoningEffort: requestOptions.reasoningEffort,
-            contextWindow: requestOptions.contextWindow,
-            maxOutputTokens: requestOptions.maxOutputTokens || req.body.max_tokens,
-            signal: controller.signal,
-            onDelta: (delta) => {
-              writeAnthropicSse(res, 'content_block_delta', {
-                type: 'content_block_delta',
-                index: 0,
-                delta: { type: 'text_delta', text: delta },
-              });
-            },
-          });
+          const completion = await qoderApi.chatCompletion(callOptions);
+          for (const chunk of completionToChunks(completion)) {
+            writer.handleChunk(chunk);
+          }
+          writer.finalize();
         } catch (streamError) {
           if (!res.writableEnded) {
-            // Emit a spec-shaped error event so clients (e.g. Claude Code) can
-            // surface the real failure instead of a bare truncated stream.
             try {
-              writeAnthropicSse(res, 'error', {
-                type: 'error',
-                error: {
-                  type: streamError.type || 'api_error',
-                  message: streamError.message || 'Upstream request failed.',
-                },
-              });
-            } catch (_) { /* ignore */ }
-            try { res.end(); } catch (_) { /* ignore */ }
+              if (writer.finished) {
+                res.end();
+              } else {
+                writeAnthropicSse(res, 'error', {
+                  type: 'error',
+                  error: {
+                    type: streamError.type || 'api_error',
+                    message: streamError.message || 'Upstream request failed.',
+                  },
+                });
+                res.end();
+              }
+            } catch { /* ignore */ }
           }
           log('anthropic stream failed', {
             code: streamError.code || 'internal_error',
@@ -552,18 +395,6 @@ function createApp() {
           });
           return;
         }
-
-        writeAnthropicSse(res, 'content_block_stop', {
-          type: 'content_block_stop',
-          index: 0,
-        });
-        writeAnthropicSse(res, 'message_delta', {
-          type: 'message_delta',
-          delta: { stop_reason: 'end_turn', stop_sequence: null },
-          usage: { output_tokens: 0 },
-        });
-        writeAnthropicSse(res, 'message_stop', { type: 'message_stop' });
-        res.end();
         log('anthropic stream completed', { duration_ms: Date.now() - started });
         trackRequest({
           model,
@@ -574,107 +405,15 @@ function createApp() {
         return;
       }
 
-      // Non-streaming path (or tool calls with stream=true → downgraded)
-      // Build working messages for potential tool-call loops
-      let workingMessagesAnthropic = [...messages];
-      let anthropicContent = '';
-      let anthropicParsedOutput = null;
-      let anthropicToolDepth = 0;
-      const MAX_ANTHROPIC_TOOL_DEPTH = 10;
-
-      while (anthropicToolDepth < MAX_ANTHROPIC_TOOL_DEPTH) {
-        const content = await qoderCli.runQoderCnCli({
-          messages: workingMessagesAnthropic,
-          model,
-          tools,
-          reasoningEffort: requestOptions.reasoningEffort,
-          contextWindow: requestOptions.contextWindow,
-          maxOutputTokens: requestOptions.maxOutputTokens || req.body.max_tokens,
-          signal: controller.signal,
-        });
-
-        anthropicContent = content;
-
-        // Parse the output for tool calls if tools were provided
-        let parsedOutput = null;
-        if (tools) {
-          parsedOutput = parseToolCallOutput(content);
-          if (parsedOutput && parsedOutput.type === 'tool_calls') {
-            log('anthropic tool calls detected', {
-              tool_count: parsedOutput.toolCalls.length,
-              tools: parsedOutput.toolCalls.map((t) => t.name),
-            });
-          } else {
-            log('anthropic no tool calls detected', { response_type: parsedOutput?.type || 'text' });
-          }
-        }
-
-        anthropicParsedOutput = parsedOutput;
-
-        // If no tool calls, we're done
-        if (!parsedOutput || parsedOutput.type !== 'tool_calls') {
-          break;
-        }
-
-        // Execute tool calls and build tool result messages
-        const toolResults = [];
-        const assistantToolCalls = [];
-
-        for (const toolCall of parsedOutput.toolCalls) {
-          const callId = generateCallId('call_');
-          assistantToolCalls.push({
-            id: callId,
-            type: 'function',
-            function: {
-              name: toolCall.name,
-              arguments: JSON.stringify(toolCall.arguments || {}),
-            },
-          });
-
-          log('executing anthropic tool', { name: toolCall.name, arguments: toolCall.arguments });
-          const result = await executeToolCall(toolCall);
-          log('anthropic tool result', { name: toolCall.name, result });
-
-          toolResults.push({
-            role: 'tool',
-            tool_call_id: callId,
-            content: JSON.stringify(result),
-          });
-        }
-
-        // Add assistant message with tool_calls
-        workingMessagesAnthropic.push({
-          role: 'assistant',
-          content: parsedOutput.prefixText || null,
-          tool_calls: assistantToolCalls,
-        });
-
-        // Add tool result messages
-        workingMessagesAnthropic.push(...toolResults);
-
-        anthropicToolDepth++;
-      }
-
-      if (anthropicToolDepth >= MAX_ANTHROPIC_TOOL_DEPTH) {
-        log('warning: max anthropic tool call depth reached', { depth: MAX_ANTHROPIC_TOOL_DEPTH });
-      }
-
-      if (req.body.stream) {
-        // Tool calls are not streamed — downgrade to non-streaming response
-        if (anthropicParsedOutput && anthropicParsedOutput.type === 'tool_calls') {
-          res.json(createAnthropicMessage({ model, content: anthropicContent, parsedOutput: anthropicParsedOutput }));
-        } else {
-          writeAnthropicMessageStream(res, { model, content: anthropicContent });
-        }
-      } else {
-        res.json(createAnthropicMessage({ model, content: anthropicContent, parsedOutput: anthropicParsedOutput }));
-      }
-      log('anthropic message request completed', { duration_ms: Date.now() - started, tool_call_depth: anthropicToolDepth });
+      const completion = await qoderApi.chatCompletion(callOptions);
+      res.json(createAnthropicMessage({ model, completion }));
+      log('anthropic message request completed', { duration_ms: Date.now() - started });
       trackRequest({
         model,
         inputText: extractTextFromMessages(req.body.messages),
-        outputText: anthropicContent || '',
+        outputText: completion.content || '',
         isError: false,
+        usage: completion.usage,
       });
     } catch (error) {
       log('anthropic message request failed', {
@@ -690,6 +429,8 @@ function createApp() {
         isError: true,
       });
       if (!res.headersSent && !res.writableEnded) anthropicError(res, error);
+    } finally {
+      clearTimer();
     }
   });
 
@@ -750,8 +491,6 @@ function createApp() {
 module.exports = {
   MODEL_ID,
   createApp,
-  createChatCompletion,
   extractRequestOptions,
-  writeChatCompletionStream,
   validateChatRequest,
 };

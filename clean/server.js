@@ -1,6 +1,6 @@
 const { createApp } = require('./app');
 const { log } = require('./logger');
-const { getCliBackend } = require('./qodercn-cli');
+const { getBackend } = require('./qoder-api');
 
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.PORT || 3000);
@@ -8,12 +8,11 @@ const PORT = Number(process.env.PORT || 3000);
 const app = createApp();
 
 app.listen(PORT, HOST, () => {
-  const backend = getCliBackend();
+  const backend = getBackend();
   log(`Qoder Proxy listening on http://${HOST}:${PORT}`);
-  log('CLI backend', {
-    name: backend.name,
-    command: backend.command,
-    home: backend.homeDir,
-    token_configured: Boolean(process.env[backend.tokenEnvVar] || process.env.QODERCN_PERSONAL_ACCESS_TOKEN),
+  log('model server', {
+    backend: backend.name,
+    host: backend.modelHost,
+    auth_home: backend.authDir,
   });
 });

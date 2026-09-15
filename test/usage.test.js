@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const qoderCli = require('../clean/qodercn-cli');
+const qoderApi = require('../clean/qoder-api');
 const { createApp } = require('../clean/app');
 const { resetUsage, getUsage } = require('../clean/usage');
 
@@ -58,8 +58,11 @@ test('POST /usage/reset-local resets all stats', async () => {
 });
 
 test('Chat request increments usage counters', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  qoderCli.runQoderCnCli = async () => 'Hello!';
+  const originalRun = qoderApi.chatCompletion;
+  qoderApi.chatCompletion = async () => ({
+    id: 'chatcmpl-t', model: 'qmodel_latest', content: 'Hello!', reasoning: '',
+    toolCalls: [], finishReason: 'stop', usage: null,
+  });
   resetUsage();
 
   const { server, baseUrl } = await listen(createApp());
@@ -81,14 +84,14 @@ test('Chat request increments usage counters', async () => {
     assert.ok(usage.estimatedInputTokens > 0, 'Should have estimated input tokens');
     assert.ok(usage.estimatedOutputTokens > 0, 'Should have estimated output tokens');
   } finally {
-    qoderCli.runQoderCnCli = originalRun;
+    qoderApi.chatCompletion = originalRun;
     server.close();
   }
 });
 
 test('Failed chat request increments error count', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  qoderCli.runQoderCnCli = async () => { throw new Error('CLI failed'); };
+  const originalRun = qoderApi.chatCompletion;
+  qoderApi.chatCompletion = async () => { throw new Error('upstream failed'); };
   resetUsage();
 
   const { server, baseUrl } = await listen(createApp());
@@ -107,14 +110,17 @@ test('Failed chat request increments error count', async () => {
     assert.equal(usage.totalRequests, 1);
     assert.equal(usage.errorCount, 1);
   } finally {
-    qoderCli.runQoderCnCli = originalRun;
+    qoderApi.chatCompletion = originalRun;
     server.close();
   }
 });
 
 test('Anthropic messages endpoint increments usage counters', async () => {
-  const originalRun = qoderCli.runQoderCnCli;
-  qoderCli.runQoderCnCli = async () => 'OK';
+  const originalRun = qoderApi.chatCompletion;
+  qoderApi.chatCompletion = async () => ({
+    id: 'chatcmpl-t', model: 'qmodel_latest', content: 'OK', reasoning: '',
+    toolCalls: [], finishReason: 'stop', usage: null,
+  });
   resetUsage();
 
   const { server, baseUrl } = await listen(createApp());
@@ -134,7 +140,7 @@ test('Anthropic messages endpoint increments usage counters', async () => {
     assert.equal(usage.totalRequests, 1);
     assert.equal(usage.requestsByModel['qwen3.7-max'], 1);
   } finally {
-    qoderCli.runQoderCnCli = originalRun;
+    qoderApi.chatCompletion = originalRun;
     server.close();
   }
 });
