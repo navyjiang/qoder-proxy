@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const qoderApi = require('../clean/qoder-api');
 const { AppError } = require('../clean/errors');
-const { createApp, extractRequestOptions } = require('../clean/app');
+const { createApp, extractRequestOptions, resolveUpstreamOptions } = require('../clean/app');
 
 function listen(app) {
   return new Promise((resolve) => {
@@ -366,4 +366,41 @@ test('extracts OpenCode and OpenAI-compatible model options', () => {
     }).reasoningEffort,
     'high'
   );
+});
+
+test('QODERCN_FORCE_EFFORT overrides client-sent effort', () => {
+  const original = process.env.QODERCN_FORCE_EFFORT;
+  try {
+    // Without force: client-sent effort (Claude Code clamps to 'high') is respected
+    delete process.env.QODERCN_FORCE_EFFORT;
+    assert.equal(
+      resolveUpstreamOptions('kimi-k3', { reasoningEffort: 'high' }).reasoningEffort,
+      'high'
+    );
+
+    // With force: overrides whatever the client sent
+    process.env.QODERCN_FORCE_EFFORT = 'max';
+    assert.equal(
+      resolveUpstreamOptions('kimi-k3', { reasoningEffort: 'high' }).reasoningEffort,
+      'max'
+    );
+
+    // Force also wins when the client sent nothing
+    assert.equal(
+      resolveUpstreamOptions('kimi-k3', {}).reasoningEffort,
+      'max'
+    );
+
+    // Force wins over model suffix effort too
+    assert.equal(
+      resolveUpstreamOptions('kimi-k3-effort-low', { reasoningEffort: 'high' }).reasoningEffort,
+      'max'
+    );
+  } finally {
+    if (original === undefined) {
+      delete process.env.QODERCN_FORCE_EFFORT;
+    } else {
+      process.env.QODERCN_FORCE_EFFORT = original;
+    }
+  }
 });

@@ -92,7 +92,10 @@ function extractRequestOptions(body) {
 // Resolve the public model id + request options into upstream call options.
 function resolveUpstreamOptions(modelId, requestOptions) {
   const route = resolveModelRoute(modelId);
-  const reasoningEffort = requestOptions.reasoningEffort
+  // QODERCN_FORCE_EFFORT overrides everything — useful when the client
+  // (e.g. Claude Code) clamps the requested effort to a lower value.
+  const reasoningEffort = process.env.QODERCN_FORCE_EFFORT
+    || requestOptions.reasoningEffort
     || route.reasoningEffort
     || process.env.QODERCN_REASONING_EFFORT
     || undefined;
@@ -492,5 +495,6 @@ module.exports = {
   MODEL_ID,
   createApp,
   extractRequestOptions,
+  resolveUpstreamOptions,
   validateChatRequest,
 };
