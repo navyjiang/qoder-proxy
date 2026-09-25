@@ -102,12 +102,15 @@ function resolveUpstreamOptions(modelId, requestOptions) {
   const maxOutputTokens = requestOptions.maxOutputTokens
     || (process.env.QODERCN_MAX_OUTPUT_TOKENS ? Number(process.env.QODERCN_MAX_OUTPUT_TOKENS) : undefined)
     || undefined;
+  const contextWindow = requestOptions.contextWindow
+    || (process.env.QODERCN_CONTEXT_WINDOW ? Number(process.env.QODERCN_CONTEXT_WINDOW) : undefined)
+    || undefined;
   log('resolved server model', { model: modelId, serverModel: route.serverModel });
   return {
     model: route.serverModel,
     reasoningEffort,
     maxOutputTokens,
-    contextWindow: requestOptions.contextWindow || undefined,
+    contextWindow,
   };
 }
 
@@ -366,9 +369,13 @@ function createApp() {
 
       if (req.body.stream) {
         sseHeaders(res);
-        const writer = createAnthropicStreamWriter(res, { model });
+        let writer = null;
         try {
           const completion = await qoderApi.chatCompletion(callOptions);
+          // Upstream usage is only known after the buffered call returns —
+          // hand it to the writer so message_start carries real input_tokens
+          // (Claude Code's context indicator reads it; 0 renders as "0%").
+          writer = createAnthropicStreamWriter(res, { model, usage: completion.usage });
           for (const chunk of completionToChunks(completion)) {
             writer.handleChunk(chunk);
           }
@@ -376,7 +383,7 @@ function createApp() {
         } catch (streamError) {
           if (!res.writableEnded) {
             try {
-              if (writer.finished) {
+              if (writer?.finished) {
                 res.end();
               } else {
                 writeAnthropicSse(res, 'error', {

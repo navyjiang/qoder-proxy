@@ -197,9 +197,117 @@ async function loadAuthWasm(wasmSource) {
     }
   }
 
+  // Allocate several strings up front; returns [[ptr, len], ...]. Capturing the
+  // length right after each allocation mirrors the bundle's Pg pattern (the
+  // shared vector-len register is overwritten by the next passString).
+  const passStrings = (strs) => strs.map((s) => {
+    if (s === null || s === undefined) return [0, 0];
+    const ptr = passString(s);
+    return [ptr, wasmVectorLen];
+  });
+
+  // --- QoderContext: agent-endpoint request preparation ----------------------
+  // Mirrors the bundle's QoderContext + RequestResult wrappers:
+  //   new QoderContext(uid, encrypt_user_info, credsJson, extra?)
+  //   refreshAuthFields(userInfoJson)                    -> void
+  //   prepareInferRequest(endpoint, bodyJson, modelKey, modelSource) -> RequestResult
+  //   RequestResult: url (string), headers (heap object), body (string)
+  // Return-area layouts (little-endian):
+  //   ptr-returning fns: [+0 ptr][+4 errObj][+8 errFlag]
+  //   string-returning fns: [+0 ptr][+4 len][+8 errObj][+12 errFlag]
+  //   void fns: [+0 errObj][+4 errFlag]
+
+  const dv = () => new DataView(wasm.memory.buffer);
+
+  function qoderContextNew(a, b, c, d) {
+    const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+    const [[p0, l0], [p1, l1], [p2, l2], [p3, l3]] = passStrings([a, b, c, d]);
+    try {
+      wasm.qodercontext_new(retptr, p0, l0, p1, l1, p2, l2, p3, l3);
+      const data = dv();
+      const errObj = data.getInt32(retptr + 4, true);
+      if (data.getInt32(retptr + 8, true) !== 0) throw takeObject(errObj);
+      return data.getInt32(retptr, true) >>> 0;
+    } finally {
+      wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+  }
+
+  function refreshAuthFields(ctxPtr, json) {
+    const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+    const [[p0, l0]] = passStrings([json]);
+    try {
+      wasm.qodercontext_refreshAuthFields(retptr, ctxPtr, p0, l0);
+      const data = dv();
+      const errObj = data.getInt32(retptr, true);
+      if (data.getInt32(retptr + 4, true) !== 0) throw takeObject(errObj);
+    } finally {
+      wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+  }
+
+  function prepareInferRequest(ctxPtr, endpoint, bodyJson, modelKey, modelSource) {
+    const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+    const [[pA, lA], [pE, lE], [pT, lT], [pI, lI]] = passStrings([endpoint, bodyJson, modelKey, modelSource]);
+    try {
+      wasm.qodercontext_prepareInferRequest(retptr, ctxPtr, pA, lA, pE, lE, pT, lT, pI, lI);
+      const data = dv();
+      const errObj = data.getInt32(retptr + 4, true);
+      if (data.getInt32(retptr + 8, true) !== 0) throw takeObject(errObj);
+      return data.getInt32(retptr, true) >>> 0;
+    } finally {
+      wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+  }
+
+  function requestResultString(fnName, rrPtr) {
+    const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+    let p = 0;
+    let l = 0;
+    try {
+      wasm[fnName](retptr, rrPtr);
+      const data = dv();
+      p = data.getInt32(retptr, true);
+      l = data.getInt32(retptr + 4, true);
+      const errObj = data.getInt32(retptr + 8, true);
+      if (data.getInt32(retptr + 12, true) !== 0) throw takeObject(errObj);
+      return getString(p, l);
+    } finally {
+      wasm.__wbindgen_add_to_stack_pointer(16);
+      if (p !== 0) wasm.__wbindgen_export4(p, l, 1);
+    }
+  }
+
+  function createQoderContext(userInfoJson) {
+    const ctxPtr = qoderContextNew('', '', JSON.stringify({ uid: '', encrypt_user_info: '', key: '' }), undefined);
+    let freed = false;
+    return {
+      refreshAuthFields: (json) => refreshAuthFields(ctxPtr, json),
+      prepareInferRequest(endpoint, bodyJson, modelKey, modelSource) {
+        const rrPtr = prepareInferRequest(ctxPtr, endpoint, bodyJson, modelKey, modelSource);
+        let rrFreed = false;
+        return {
+          url: requestResultString('requestresult_url', rrPtr),
+          body: requestResultString('requestresult_body', rrPtr),
+          headers: takeObject(wasm.requestresult_headers(rrPtr)),
+          free() {
+            if (!rrFreed) { rrFreed = true; wasm.__wbg_requestresult_free(rrPtr, 0); }
+          },
+        };
+      },
+      free() {
+        if (!freed) { freed = true; wasm.__wbg_qodercontext_free(ctxPtr, 0); }
+      },
+    };
+  }
+
   return {
     credentialStorageDecrypt: (ciphertext, key) => callStringString(wasm.credential_storage_decrypt, ciphertext, key),
     credentialStorageEncrypt: (plaintext, key) => callStringString(wasm.credential_storage_encrypt, plaintext, key),
+    // Inverse of the Encode=1 request/response transform — diagnostics tool
+    // for decoding captured CLI traffic.
+    decryptServerResponse: (payload) => callStringString(wasm.decrypt_server_response, payload, ''),
+    createQoderContext,
   };
 }
 

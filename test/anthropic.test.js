@@ -181,6 +181,26 @@ test('stream writer maps OpenAI chunks to Anthropic SSE', () => {
   assert.equal(writer.finished, true);
 });
 
+test('stream writer reports real input_tokens from upstream usage', () => {
+  const { res, text } = collectWrites();
+  const writer = createAnthropicStreamWriter(res, {
+    model: 'kimi-k3',
+    usage: { prompt_tokens: 36109, completion_tokens: 240 },
+  });
+
+  writer.handleChunk({ choices: [{ index: 0, delta: { content: 'Hi' } }] });
+  writer.handleChunk({
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 36109, completion_tokens: 240 },
+  });
+
+  const out = text();
+  // message_start must carry real input_tokens so the client's context
+  // indicator doesn't render 0%.
+  assert.match(out, /message_start[\s\S]*"input_tokens":36109/);
+  assert.match(out, /message_delta[\s\S]*"input_tokens":36109,"output_tokens":240|"output_tokens":240,"input_tokens":36109/);
+});
+
 test('stream writer finalizes cleanly when upstream ends without finish_reason', () => {
   const { res, text } = collectWrites();
   const writer = createAnthropicStreamWriter(res, { model: 'kimi-k3' });

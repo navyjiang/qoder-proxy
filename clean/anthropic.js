@@ -205,7 +205,17 @@ function writeAnthropicSse(res, event, payload) {
 // Streaming converter: OpenAI chat.completion.chunk events → Anthropic SSE.
 // Maps reasoning_content → thinking blocks, content → text blocks, and
 // streamed tool_calls → tool_use blocks with input_json_delta fragments.
-function createAnthropicStreamWriter(res, { model }) {
+// Anthropic-format usage block built from the upstream (OpenAI-style) usage.
+// Claude Code's context indicator reads usage from message_start /
+// message_delta — input_tokens of 0 renders as "0% context used", so always
+// populate it from the real upstream numbers when we have them.
+function anthropicUsage(usage, { withInput = false } = {}) {
+  const block = { output_tokens: usage?.completion_tokens || 0 };
+  if (withInput) block.input_tokens = usage?.prompt_tokens || 0;
+  return block;
+}
+
+function createAnthropicStreamWriter(res, { model, usage = null }) {
   const msgId = `msg_${crypto.randomUUID().replace(/-/g, '')}`;
   let started = false;
   let blockIndex = -1;
@@ -228,7 +238,7 @@ function createAnthropicStreamWriter(res, { model }) {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
+        usage: anthropicUsage(usage, { withInput: true }),
       },
     });
   }
@@ -277,9 +287,10 @@ function createAnthropicStreamWriter(res, { model }) {
     pending.args.length = 0;
   }
 
-  function finish(finishReason, usage) {
+  function finish(finishReason, finishUsage) {
     if (finished) return;
     finished = true;
+    const finalUsage = finishUsage || usage;
     start();
     // A tool call that never got a name is uncallable — emitting it with an
     // empty name hard-errors clients, so drop it.
@@ -287,7 +298,7 @@ function createAnthropicStreamWriter(res, { model }) {
     writeAnthropicSse(res, 'message_delta', {
       type: 'message_delta',
       delta: { stop_reason: mapStopReason(finishReason), stop_sequence: null },
-      usage: { output_tokens: usage?.completion_tokens || 0 },
+      usage: anthropicUsage(finalUsage, { withInput: true }),
     });
     writeAnthropicSse(res, 'message_stop', { type: 'message_stop' });
     res.end();
