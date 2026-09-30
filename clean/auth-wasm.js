@@ -43,6 +43,36 @@ function resolveCliBundlePath(command) {
 
 // Extract the embedded auth wasm from the CLI bundle. There may be several
 // embedded wasms; the auth module is the one exporting credential_storage_decrypt.
+//
+// Embedding style varies by CLI version:
+//   - older builds: plain base64 string literals (optionally in a data: URL)
+//   - newer builds (>= ~1.0.36): base64 blobs obfuscated as _$d("<xor'd>"),
+//     where _$d applies a repeating-XOR with a key defined next to it at the
+//     top of the bundle
+function* iterWasmBase64(source) {
+  const plain = /(?:["'`]|base64,)(AGFzbQE[A-Za-z0-9+/=]{1000,})/g;
+  let match;
+  while ((match = plain.exec(source))) yield match[1];
+
+  const keyMatch = /\$d=\(s,k="([^"]+)"\)/.exec(source);
+  const key = keyMatch ? keyMatch[1] : 'EiB72RZVHSeM';
+  const marker = '$d("';
+  let idx = source.indexOf(marker);
+  while (idx !== -1) {
+    const start = idx + marker.length;
+    const end = source.indexOf('"', start);
+    if (end === -1) break;
+    const literal = source.slice(start, end);
+    idx = source.indexOf(marker, end);
+    // the wasm blob is large; skip the thousands of small obfuscated strings
+    if (literal.length < 10000 || !/^[A-Za-z0-9+/=]+$/.test(literal)) continue;
+    const bytes = Buffer.from(literal, 'base64');
+    for (let i = 0; i < bytes.length; i++) bytes[i] ^= key.charCodeAt(i % key.length);
+    const decoded = bytes.toString('utf8');
+    if (decoded.startsWith(WASM_MAGIC_BASE64)) yield decoded;
+  }
+}
+
 function extractAuthWasm(bundlePath, cacheDir) {
   const stat = fs.statSync(bundlePath);
   const cacheFile = cacheDir
@@ -51,10 +81,8 @@ function extractAuthWasm(bundlePath, cacheDir) {
   if (cacheFile && fs.existsSync(cacheFile)) return cacheFile;
 
   const source = fs.readFileSync(bundlePath, 'utf8');
-  const re = /["'`](AGFzbQE[A-Za-z0-9+/=]{1000,})["'`]/g;
-  let match;
-  while ((match = re.exec(source))) {
-    const bytes = Buffer.from(match[1], 'base64');
+  for (const base64 of iterWasmBase64(source)) {
+    const bytes = Buffer.from(base64, 'base64');
     try {
       const mod = new WebAssembly.Module(bytes);
       const exports = WebAssembly.Module.exports(mod).map((e) => e.name);
