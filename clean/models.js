@@ -12,7 +12,7 @@ const MODELS = [
   { id: 'qwen3.7-max', name: 'Qwen3.7-Max', serverModel: 'qmodel_latest', reasoning: true },
   { id: 'qwen3.7-plus', name: 'Qwen3.7-Plus', serverModel: 'qmodel', reasoning: true },
   { id: 'kimi-k3', name: 'Kimi-K3', serverModel: 'kmodel_latest', reasoning: true },
-  { id: 'kimi-k2.7-code', name: 'Kimi-K2.7-Code', serverModel: 'kmodel', reasoning: true },
+  { id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', serverModel: 'kmodel', reasoning: true },
   { id: 'glm-5.3', name: 'GLM-5.3', serverModel: 'gmodel', reasoning: true },
   { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', serverModel: 'gfmodel', reasoning: true },
   { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', serverModel: 'dmodel', reasoning: true },
