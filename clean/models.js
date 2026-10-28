@@ -16,7 +16,7 @@ const MODELS = [
   { id: 'glm-5.3', name: 'GLM-5.3', serverModel: 'gmodel', reasoning: true },
   { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', serverModel: 'gfmodel', reasoning: true },
   { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', serverModel: 'dmodel', reasoning: true },
-  { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', serverModel: 'dfmodel', reasoning: true },
+  { id: 'deepseek-flash', name: 'DeepSeek-Flash', serverModel: 'dfmodel', reasoning: true },
   { id: 'minimax-m3', name: 'MiniMax-M3', serverModel: 'mmodel', reasoning: true },
 ];
 
